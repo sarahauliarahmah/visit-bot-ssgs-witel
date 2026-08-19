@@ -11,8 +11,16 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "axios": "^1.19.0",
+    "cloudinary": "^2.10.0",
     "dotenv": "^17.4.2",
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1",
+    "node-cron": "^4.6.0",
+    "node-html-to-image": "^6.2.0",
     "node-telegram-bot-api": "^1.2.0",
-    "pg": "^8.23.0"
+    "pg": "^8.23.0",
+    "sharp": "^0.35.3",
+    "telegraf": "^4.16.3"
   }
 }
