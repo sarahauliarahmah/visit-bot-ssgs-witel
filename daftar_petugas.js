@@ -1,3 +1,4 @@
+// daftar_petugas.js
 'use strict';
 const { Markup } = require('telegraf');
 
@@ -78,7 +79,7 @@ module.exports = function(bot, pool) {
 
         } catch (err) {
             console.error('Insert DB Error:', err);
-            await ctx.answerCbQuery('❌ Gagal menyimpan data ke Aiven PostgreSQL!', { show_alert: true });
+            await ctx.answerCbQuery('❌ Gagal menyimpan data ke Database!', { show_alert: true });
         }
     });
 

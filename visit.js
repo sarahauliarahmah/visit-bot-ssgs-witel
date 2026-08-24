@@ -1,3 +1,4 @@
+// visit.js
 'use strict';
 
 // 1. Panggil Cloudinary (Axios dan Sharp sudah dibuang)
@@ -12,7 +13,7 @@ cloudinary.config({
 
 module.exports = function (bot, pool) {
 
-    // ================= 1. LISTENER PESAN TEKS & MEDIA =================
+// ================= 1. LISTENER PESAN TEKS & MEDIA =================
     bot.on('message', async (ctx, next) => {
         const session = ctx.session;
         const text = ctx.message.text ? ctx.message.text.trim() : '';
@@ -22,6 +23,10 @@ module.exports = function (bot, pool) {
 
         try {
             if (session.step === 1) {
+                // VALIDASI: ID Pelanggan minimal 10 karakter (mencegah input asal seperti "1" atau "ok")
+                if (text.length < 10) {
+                    return ctx.reply('⚠️ Format salah! *ID Pelanggan / No. Internet* terlalu pendek (minimal 10 karakter). Silakan coba lagi:', { parse_mode: 'Markdown' });
+                }
                 session.data.id_pelanggan = text;
                 session.step = 2;
                 return ctx.reply(`Tahap 2/10: Masukkan <b>Nama Pelanggan / Instansi</b> (Contoh: PT Maju Jaya / Klinik Sehat):`, { parse_mode: 'HTML' });
@@ -37,15 +42,35 @@ module.exports = function (bot, pool) {
                 return ctx.reply(`Tahap 4/10: Masukkan <b>Nomor Contact Person</b>:`, { parse_mode: 'HTML' });
             }
             else if (session.step === 4) {
-                session.data.no_cp = text;
+                // VALIDASI & SANITASI: Ekstrak hanya angka. Jika user mengetik "0812-3456-7890", tanda strip akan dibuang.
+                const cleanNoCP = text.replace(/[^0-9]/g, ''); 
+                
+                // Cek apakah jumlah angkanya logis untuk nomor telepon (9 hingga 15 digit)
+                if (cleanNoCP.length < 9 || cleanNoCP.length > 15) {
+                    return ctx.reply('⚠️ Format salah! Harap masukkan *Nomor Contact Person* berupa ANGKA yang valid (9-15 digit):', { parse_mode: 'Markdown' });
+                }
+                
+                session.data.no_cp = cleanNoCP; // Menyimpan angka yang sudah bersih ke memori
                 session.step = 5;
-                return ctx.reply(`Tahap 5/10: Masukkan <b>Nama Telkom Daerah / Datel</b>:`, { parse_mode: 'HTML' });
+                return ctx.reply('Tahap 5/10: Silakan pilih Telkom Daerah (TelDa) berikut', {
+                    parse_mode: 'Markdown',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: 'Binjai', callback_data: 'telda_Binjai' }, { text: 'Kabanjahe', callback_data: 'telda_Kabanjahe' }],
+                            [{ text: 'Kisaran', callback_data: 'telda_Kisaran' }, { text: 'Lubuk Pakam', callback_data: 'telda_Lubuk Pakam' }],
+                            [{ text: 'Inner-Sumut', callback_data: 'telda_Inner-Sumut' }, { text: 'Padang Sidempuan', callback_data: 'telda_Padang Sidempuan' }],
+                            [{ text: 'Rantau Prapat', callback_data: 'telda_Rantau Prapat' }, { text: 'Siantar', callback_data: 'telda_Siantar' }],
+                            [{ text: 'Sibolga', callback_data: 'telda_Sibolga' },  {text: 'Toba', callback_data: 'telda_Toba' }]
+                        ]
+                    }
+                });
             }
             else if (session.step === 5) {
                 session.data.telkom_daerah = text;
                 session.step = 6;
                 return ctx.reply(`Tahap 6/10: Masukkan <b>Keterangan Visit</b>:`, { parse_mode: 'HTML' });
             }
+            
             else if (session.step === 6) {
                 session.data.keterangan_visit = text;
                 session.step = 7;
@@ -67,7 +92,7 @@ module.exports = function (bot, pool) {
                 session.data.hasil_visit = text;
                 session.step = 8;
                 await ctx.reply(`✅ Hasil visit dicatat: <b>${text}</b>\n\n⏳ Memuat daftar petugas aktif...`, { parse_mode: 'HTML' });
-                return showPetugasMenu(ctx, pool);
+                return showPetugasMenu(ctx, pool); // Mengacu pada fungsi pembantu di bawah
             }
             else if (session.step === 8) {
                 session.data.nama_petugas = text; 
@@ -84,7 +109,7 @@ module.exports = function (bot, pool) {
             else if (session.step === 10) {
                 if (!ctx.message.photo) return ctx.reply('⚠️ Mohon lampirkan foto bukti visit.');
                 
-                await ctx.reply('⏳ Mengunggah foto ke Cloudinary & mencatat log ke Aiven...');
+                await ctx.reply('⏳ Mengunggah foto ke Cloudinary & mencatat log ke Database...');
                 
                 try {
                     const photo = ctx.message.photo[ctx.message.photo.length - 1];
@@ -92,40 +117,27 @@ module.exports = function (bot, pool) {
                     const d = session.data;
                     
                     // --- UPLOAD KE CLOUDINARY ---
-                    // 1. Dapatkan URL file asli dari Telegram
                     const fileLink = await ctx.telegram.getFileLink(fileId);
-                    
-                    // 2. Upload otomatis ke Cloudinary (diubah ke WebP secara pintar oleh Cloudinary)
                     const uploadResult = await cloudinary.uploader.upload(fileLink.href, {
                         folder: 'indibiz_visit',
                         format: 'webp',
                         quality: 'auto'
                     });
                     
-                    const fotoUrlCloudinary = uploadResult.secure_url; // Ini Link URL WebP jadinya
+                    const fotoUrlCloudinary = uploadResult.secure_url; 
 
                     // --- ANTI-FRAUD LOGIC ---
                     const realTelegramId = ctx.from.id.toString();
 
                     // --- SIMPAN KE AIVEN ---
-                    // Menyimpan Link URL (VARCHAR) ke dalam kolom foto_bukti
                     await pool.query(
                         `INSERT INTO data_visit 
                         (no_inet, nama_pelanggan, nama_cp, no_cp, telkom_daerah, keterangan_visit, hasil_visit, telegram_id, nama_petugas, latitude, longitude, foto_bukti, waktu_lapor) 
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)`,
                         [
-                            d.id_pelanggan, 
-                            d.nama_pelanggan, 
-                            d.nama_cp, 
-                            d.no_cp, 
-                            d.telkom_daerah, 
-                            d.keterangan_visit, 
-                            d.hasil_visit, 
-                            realTelegramId,       // $8: ID Pelaku Asli (Anti-Fraud)
-                            d.nama_petugas,       // $9: Nama yang diklaim di bot
-                            d.latitude, 
-                            d.longitude, 
-                            fotoUrlCloudinary     // $12: Menyimpan Link Teks dari Cloudinary
+                            d.id_pelanggan, d.nama_pelanggan, d.nama_cp, d.no_cp, d.telkom_daerah, 
+                            d.keterangan_visit, d.hasil_visit, realTelegramId, d.nama_petugas, 
+                            d.latitude, d.longitude, fotoUrlCloudinary 
                         ]
                     );
 
@@ -147,6 +159,20 @@ module.exports = function (bot, pool) {
     });
 
     // ================= 2. LISTENER KLIK TOMBOL INLINE =================
+
+    bot.action(/^telda_(.+)$/, async (ctx) => {
+        const session = ctx.session;
+        if (!session || session.step !== 5) return ctx.answerCbQuery('⚠️ Sesi kadaluarsa.', { show_alert: true }); 
+
+        const selectedTelda = ctx.match[1];
+        session.data.telkom_daerah = selectedTelda;
+        session.step = 6;
+
+        await ctx.answerCbQuery();
+        await ctx.editMessageText(`Tahap 5/10: Silakan pilih Telkom Daerah (TelDa) berikut -> <b>${selectedTelda}</b>`, { parse_mode: 'HTML' });
+        return ctx.reply(`Tahap 6/10: Masukkan <b>Keterangan Visit</b>:`, { parse_mode: 'HTML' });
+    });
+
     bot.action(/^result_(.+)$/, async (ctx) => {
         const session = ctx.session;
         if (!session || session.step !== 7) return ctx.answerCbQuery('⚠️ Sesi kadaluarsa.', { show_alert: true }); 
