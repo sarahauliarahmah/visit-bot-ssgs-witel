@@ -1,282 +1,196 @@
-// index.js
-'use strict';
-
 require('dotenv').config();
-const { Telegraf, Markup } = require('telegraf');
-const { Pool } = require('pg');
+const { Telegraf, session, Markup } = require('telegraf');
+const { createClient } = require('@supabase/supabase-js');
 
-// ================= DATABASE (AIVEN) =================
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+// const bot = new Telegraf(process.env.BOT_TOKEN);
+
+const https = require('https');
+
+const agent = new https.Agent({ keepAlive: false, family: 4 });
+const bot = new Telegraf(process.env.BOT_TOKEN, {
+    telegram: { agent }
 });
 
-pool.on('error', (err) => {
-  console.error('[index.js] Unexpected PG pool error:', err);
+bot.use(session());
+
+bot.catch((err, ctx) => {
+    console.error(`Error pada update ${ctx.update?.update_id}:`, err.message);
+    // Jangan di-throw ulang supaya proses tidak mati
 });
 
-// ================= SISTEM MANAJEMEN MEMORI (SESSION & GARBAGE COLLECTOR) =================
-const bot = new Telegraf(process.env.TELEGRAM_TOKEN);
-const sessionStore = new Map();
-const SESSION_TTL_MS = 30 * 60 * 1000; // Batas waktu sesi 30 Menit (dalam milidetik)
+process.on('unhandledRejection', (err) => {
+    console.error('Unhandled rejection:', err?.message || err);
+});
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception:', err?.message || err);
+});
 
+// Default session supaya tidak error saat dibaca modul lain
 bot.use((ctx, next) => {
-    const key = ctx.from && ctx.chat ? `${ctx.from.id}:${ctx.chat.id}` : null;
-    if (!key) return next();
-
-    let session = sessionStore.get(key);
-    const now = Date.now();
-
-    if (session && (now - session.lastActivity > SESSION_TTL_MS)) {
-        session = null; 
-        if (ctx.callbackQuery || ctx.message) {
-            ctx.reply('⏳ Sesi pengisian laporan Anda telah berakhir otomatis karena tidak ada aktivitas selama 30 menit. Silakan mulai ulang.');
-        }
-    }
-
-    if (!session) {
-        session = { step: 'idle', data: {}, lastActivity: now };
-    } else {
-        session.lastActivity = now; 
-    }
-
-    ctx.session = session;
-    sessionStore.set(key, session);
-
+    ctx.session = ctx.session || { step: 'idle', data: {} };
     return next();
 });
 
-// GARBAGE COLLECTOR
-setInterval(() => {
-    const now = Date.now();
-    let deletedCount = 0;
-    for (const [key, session] of sessionStore.entries()) {
-        if (now - session.lastActivity > SESSION_TTL_MS) {
-            sessionStore.delete(key);
-            deletedCount++;
-        }
-    }
-    if (deletedCount > 0) {
-        console.log(`🧹 [Garbage Collector] Berhasil menghapus ${deletedCount} sesi menggantung. Sisa memori aktif: ${sessionStore.size}`);
-    }
-}, 60 * 60 * 1000);
+// ============================================================================
+// LOGGING AKSES KE TERMINAL -- Master Admin memantau SIAPA SAJA yang
+// mengakses bot lewat output terminal/console tempat bot berjalan.
+// ============================================================================
+bot.use((ctx, next) => {
+    const identitas = ctx.from?.username
+        ? `@${ctx.from.username}`
+        : (ctx.from?.first_name || `ID:${ctx.from?.id ?? '-'}`);
+    const waktu = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+    const jenis = ctx.chat?.type === 'private' ? 'private' : `grup ${ctx.chat?.id}`;
+    const isi = ctx.message?.text
+        || (ctx.message?.photo ? '[foto]' : '')
+        || (ctx.message?.location ? '[lokasi]' : '')
+        || (ctx.callbackQuery?.data ? `[tombol: ${ctx.callbackQuery.data}]` : '')
+        || '[media lain]';
+    console.log(`(${waktu}) Dipakai oleh ${identitas} (${ctx.from?.id}) via ${jenis} -> ${isi}`);
+    return next();
+});
 
-// ================= SISTEM KEAMANAN & RBAC =================
-const petugasCache = new Map();
-const PETUGAS_CACHE_TTL_MS = 5 * 60 * 1000; 
+// ============================================================================
+// PEMBATASAN AKSES -- Bot hanya untuk karyawan yang dikenali.
+// Command publik hanya untuk pendaftaran & bantuan dasar; fitur lain lewat
+// tombol menu (yang tetap melewati pengecekan role di handler masing-masing).
+// ============================================================================
+const { isRegisteredPetugas, isAdmin, isMasterAdmin } = require('./daftar_petugas');
 
-async function getPetugasRole(userId) {
-    const cached = petugasCache.get(userId);
-    if (cached && cached.expiresAt > Date.now()) return cached.role;
-
-    try {
-        const res = await pool.query('SELECT role, status_aktif FROM petugas WHERE telegram_id = $1', [userId]);
-        if (res.rows.length > 0 && res.rows[0].status_aktif === true) {
-            const userRole = res.rows[0].role;
-            petugasCache.set(userId, { role: userRole, expiresAt: Date.now() + PETUGAS_CACHE_TTL_MS });
-            return userRole;
-        }
-        return null;
-    } catch (err) {
-        console.error('DB Error checking petugas:', err);
-        return null;
-    }
-}
+// Teks tombol publik + command publik. Command fitur (/visit, /laporan_visit,
+// dst) SENGAJA tidak dipublikasikan di menu Telegram, tapi tetap bisa diketik
+// manual oleh yang berhak.
+const PUBLIC_TEXTS = ['/daftar', '/start', '/help', '/cancel', '📝 Daftar Akun', 'ℹ️ Bantuan'];
 
 bot.use(async (ctx, next) => {
     const userId = ctx.from?.id?.toString();
+    if (!userId) return next();
+
+    // Callback query dibiarkan lewat -- handler tombol masing-masing yang
+    // cek role-nya (supaya penolakan berjalan benar).
+    if (ctx.callbackQuery) return next();
+
     const text = ctx.message?.text || '';
-    const masterAdminId = process.env.ADMIN_CHAT_ID; 
-
-    if (text.startsWith('/start') || text === '/cancel') {
-        return next();
-    }
-
-    if (userId === masterAdminId) {
-        ctx.state.role = 'master_admin'; 
-        return next();
-    }
-
-    const role = await getPetugasRole(userId);
-    if (role) {
-        ctx.state.role = role; 
-        return next();
-    }
-
-    if (ctx.callbackQuery) {
-        return ctx.answerCbQuery('⛔ Anda belum terdaftar. Silakan ketik /start untuk meminta akses.', { show_alert: true });
-    } else {
-        console.log(`⛔ Akses ditolak untuk user ${userId}`);
-        return; 
-    }
-});
-
-// ================= COMMAND: /start =================
-bot.start(async (ctx) => {
-    const userId = ctx.from.id.toString();
-    const nama = ctx.from.first_name || 'Petugas';
-    const masterAdminId = process.env.ADMIN_CHAT_ID;
-
-    let isRegistered = false;
-    if (userId === masterAdminId) {
-        isRegistered = true;
-    } else {
-        const role = await getPetugasRole(userId);
-        if (role) isRegistered = true;
-    }
-
-    if (!isRegistered) {
-        if (typeof bot.handleNewUserRegistration === 'function') {
-            return bot.handleNewUserRegistration(ctx);
-        }
-        return ctx.reply('⚠️ Modul pendaftaran belum dimuat.');
-    }
-
-    // UX DIPERBAIKI: Penambahan tombol Bantuan
-    const menuMarkup = Markup.inlineKeyboard([
-        [Markup.button.callback('🚀 Mulai Visit', 'btn_visit'), Markup.button.callback('📜 Riwayat Visit', 'btn_riwayat')],
-        [Markup.button.callback('📊 Rekap Laporan', 'btn_laporan'), Markup.button.callback('💡 Bantuan', 'btn_help')]
-    ]);
-
-    ctx.reply(
-        `👋 Halo <b>${nama}</b>!\nSelamat datang di Bot Penagihan & Laporan Indibiz Witel Sumut.\n\nSilakan pilih menu operasional di bawah ini:`,
-        {
-            parse_mode: 'HTML',
-            ...menuMarkup
-        }
+    const isPublic = PUBLIC_TEXTS.some(t =>
+        text === t || (t.startsWith('/') && (text.startsWith(t + ' ') || text.startsWith(t + '@')))
     );
+    if (isPublic) return next();
+
+    if (await isRegisteredPetugas(supabase, userId)) return next();
+
+    console.log(`Akses DITOLAK untuk user ${userId} (@${ctx.from?.username || '-'})`);
+    if (text && !ctx.message?.photo && !ctx.message?.location) {
+        await ctx.reply(
+            'Anda belum terdaftar sebagai karyawan yang dikenali.\nTekan tombol di bawah untuk mengajukan akses.',
+            Markup.keyboard([['📝 Daftar Akun'], ['ℹ️ Bantuan']]).resize()
+        );
+    }
 });
+
+// ============================================================================
+// MENU UTAMA -- Tombol keyboard yang disesuaikan per role.
+// Tombol mengirim teks yang ditangkap handler command di modul masing-masing,
+// jadi klik tombol == ketik command manual.
+// ============================================================================
+async function kirimMenuUtama(ctx, teksAwal) {
+    const userId = String(ctx.from.id);
+    let tombol, teks;
+
+    if (await isMasterAdmin(supabase, userId)) {
+        tombol = [
+            ['📋 Lapor Visit', '📊 Laporan Visit'],
+            ['📝 Riwayat Visit', '👥 Daftar Petugas'],
+            ['⚙️ Atur Role', 'ℹ️ Bantuan']
+        ];
+        teks = teksAwal || 'Menu Utama — Master Admin\nPilih fitur di bawah (atau ketik command-nya secara manual):';
+    } else if (await isAdmin(supabase, userId)) {
+        tombol = [
+            ['📋 Lapor Visit', '📊 Laporan Visit'],
+            ['📝 Riwayat Visit', 'ℹ️ Bantuan']
+        ];
+        teks = teksAwal || 'Menu Utama — Admin\nPilih fitur di bawah (atau ketik command-nya secara manual):';
+    } else if (await isRegisteredPetugas(supabase, userId)) {
+        tombol = [['📋 Lapor Visit'], ['ℹ️ Bantuan']];
+        teks = teksAwal || 'Menu Utama — Karyawan Visit\nPilih fitur di bawah:';
+    } else {
+        tombol = [['📝 Daftar Akun'], ['ℹ️ Bantuan']];
+        teks = teksAwal || 'Anda belum terdaftar.\nTekan tombol di bawah untuk mengajukan akses ke bot:';
+    }
+    return ctx.reply(teks, Markup.keyboard(tombol).resize());
+}
+
+const helpText =
+`Bantuan — Sistem Laporan Visit
+
+Menu Telegram bot ini hanya berisi 3 command: /start, /help, /cancel.
+Semua fitur lain diakses lewat TOMBOL menu (atau tetap bisa diketik manual):
+
+📋 Lapor Visit (/visit) — buat laporan visit. Bisa dipakai karyawan, admin, master admin.
+📊 Laporan Visit (/laporan_visit) — rekap laporan visit. Admin pilih periode lewat tombol, lalu pilih export PNG atau Excel.
+📝 Riwayat Visit (/riwayat_visit) — riwayat visit per ID pelanggan. Ketik ID-nya saja, lalu pilih periode lewat tombol.
+👥 Daftar Petugas (/daftar_petugas) — lihat semua pengguna bot (master admin).
+⚙️ Atur Role (/atur_role) — ubah role pengguna via tombol (master admin).
+📝 Daftar Akun (/daftar) — ajukan akses untuk user baru.
+
+Tips:
+- Selama proses input bertahap, ketik /cancel untuk membatalkan.
+- Format tanggal bebas: 05 11 2026 | 05/11/2026 | 05 November 2026 | rentang: 01 11 2026 05 11 2026
+- Command dengan argumen tetap bisa: /riwayat_visit 111201107052 01 11 2026 05 11 2026
+
+Role:
+- Karyawan Visit : hanya lapor visit
+- Admin : lapor visit + laporan & riwayat visit
+- Master Admin : semua fitur + kelola pendaftaran & role`;
+
+bot.start((ctx) => kirimMenuUtama(ctx));
+
+async function helpHandler(ctx) {
+    await ctx.reply(helpText);
+    return kirimMenuUtama(ctx);
+}
+bot.help(helpHandler);
+bot.hears('ℹ️ Bantuan', helpHandler);
 
 bot.command('cancel', (ctx) => {
     if (ctx.session.step !== 'idle') {
         ctx.session.step = 'idle';
         ctx.session.data = {};
-        ctx.reply('❌ Proses input yang sedang berjalan telah dibatalkan.', {
-            reply_markup: { remove_keyboard: true } 
-        });
+        ctx.reply('Proses yang sedang berjalan telah dibatalkan.');
     } else {
-        ctx.reply('ℹ️ Tidak ada proses aktif yang sedang berjalan.', {
-            reply_markup: { remove_keyboard: true } 
-        });
+        ctx.reply('Tidak ada proses yang sedang berjalan.');
     }
+    return kirimMenuUtama(ctx);
 });
 
-// ================= MODUL =================
-require('./visit')(bot, pool); 
-require('./daftar_petugas')(bot, pool);
-const reportManager = require('./report_manager')(bot, pool); // Mesin Pelaporan Baru
+// ============================================================================
+// MODUL FITUR
+// ============================================================================
+require('./daftar_petugas')(bot, supabase);   // pendaftaran, persetujuan, daftar petugas, atur role
+require('./visit')(bot, supabase);            // lapor visit (semua role approved)
+require('./report_manager')(bot, supabase);   // laporan visit (rekap + export) & riwayat visit (admin ke atas)
 
-// ----- AREA KHUSUS ADMIN -----
-function isAdmin(ctx) {
-    return ctx.state.role === 'admin' || ctx.state.role === 'master_admin';
-}
-
-
-// ================= HANDLING KLIK TOMBOL & COMMAND =================
-
-// 1. FITUR VISIT UMUM
-bot.action('btn_visit', async (ctx) => {
-    await ctx.answerCbQuery();
-    ctx.session.step = 1;
-    ctx.session.data = {};
-    return ctx.reply('🚀 Memulai laporan visit.\n\nTahap 1: Silakan masukkan *ID Pelanggan*:', { 
-        parse_mode: 'Markdown',
-        reply_markup: { remove_keyboard: true }
-    });
+// ============================================================================
+// MENU COMMAND TELEGRAM -- SENGAJA HANYA 3 COMMAND.
+// Fitur lain diakses lewat tombol menu (lihat kirimMenuUtama).
+// ============================================================================
+bot.telegram.setMyCommands([
+    { command: 'start', description: 'Tampilkan menu utama (tombol fitur)' },
+    { command: 'help', description: 'Bantuan penggunaan bot' },
+    { command: 'cancel', description: 'Batalkan proses input yang sedang berjalan' }
+]).then(() => {
+    console.log('Menu command Telegram berhasil disinkronkan.');
+}).catch((err) => {
+    console.error('Gagal mengatur menu command:', err.message);
 });
 
-// 2. FITUR RIWAYAT
-bot.command('riwayat', async (ctx) => {
-    const textArgs = ctx.message.text.replace('/riwayat', '').trim();
-    if (textArgs.length > 5) {
-        return reportManager.tarikRiwayatId(ctx, textArgs);
-    }
-    ctx.session.step = 'menunggu_id_riwayat_visit';
-    ctx.reply('🔍 Silakan ketik *ID Pelanggan / No. Internet*:', { parse_mode: 'Markdown' });
+// ============================================================================
+// NYALAKAN BOT
+// ============================================================================
+bot.launch().then(() => {
+    console.log('Bot Laporan Visit berhasil menyala dan siap menerima perintah!');
+    console.log('Pantau baris log "Dipakai oleh ..." untuk melihat siapa yang mengakses bot.');
 });
-
-bot.action('btn_riwayat', async (ctx) => {
-    await ctx.answerCbQuery();
-    ctx.session.step = 'menunggu_id_riwayat_visit';
-    return ctx.reply('🔍 Masukkan *ID Pelanggan / No. Internet* untuk melihat histori visitnya:', { 
-        parse_mode: 'Markdown',
-        reply_markup: { remove_keyboard: true } 
-    });
-});
-
-
-bot.on('message', async (ctx, next) => {
-    if (ctx.session && ctx.session.step === 'menunggu_id_riwayat_visit') {
-        const text = ctx.message.text || '';
-        const cleanId = text.replace(/[^0-9]/g, '');
-        if (cleanId.length < 8) return ctx.reply('⚠️ ID harus berupa angka valid (minimal 8 digit).');
-        return reportManager.tarikRiwayatId(ctx, cleanId);
-    }
-    return next();
-});
-
-// 3. FITUR REKAP & EXCEL (DIKUNCI UNTUK ADMIN)
-bot.action('btn_laporan', async (ctx) => {
-    if (!isAdmin(ctx)) return ctx.answerCbQuery('⛔ Hanya Admin yang bisa mengakses Laporan!', { show_alert: true });
-    await ctx.answerCbQuery();
-    return reportManager.tarikDataRekap(ctx, '', true); 
-});
-
-bot.command('rekap', async (ctx) => {
-    if (!isAdmin(ctx)) return ctx.reply('⛔ Hanya Admin yang bisa mengakses command ini.');
-    const textArgs = ctx.message.text.replace('/rekap', '').trim();
-    return reportManager.tarikDataRekap(ctx, textArgs, false); 
-});
-
-bot.action(/^cetak_html_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return ctx.answerCbQuery('⛔ Akses ditolak!', { show_alert: true });
-    await ctx.answerCbQuery('⏳ Mempersiapkan gambar tabel...');
-    const params = ctx.match[1].split('_');
-    return reportManager.cetakTabelGambar(ctx, params[0], params[1]);
-});
-
-bot.action(/^cetak_excel_(.+)$/, async (ctx) => {
-    if (!isAdmin(ctx)) return ctx.answerCbQuery('⛔ Akses ditolak!', { show_alert: true });
-    await ctx.answerCbQuery('⏳ Mempersiapkan file Excel...');
-    const params = ctx.match[1].split('_');
-    return reportManager.cetakExcel(ctx, params[0], params[1]);
-});
-
-//4. FITUR BANTUAN
-
-bot.action('btn_help', async (ctx) => {
-    // Menghilangkan ikon loading pada tombol yang ditekan
-    await ctx.answerCbQuery(); 
-    
-    const pesanHelp = `
-💡 *PANDUAN PENGGUNAAN VISIT BOT* 💡
-
-Bot ini dirancang khusus untuk pelaporan dan penagihan pelanggan Indibiz SSGS Witel Sumut.
-
-*A. Alur Pelaporan Teknisi*
-1. Tekan tombol *🚀 Mulai Visit*.
-2. Jawab pertanyaan bot secara berurutan.
-3. Pastikan Anda berada di lokasi saat mengirim Titik Koordinat (Share Location).
-4. Lampirkan Foto Bukti fisik sebagai langkah terakhir.
-
-*B. Daftar Perintah Cepat*
-/start - Membuka menu utama
-/riwayat - Mencari histori visit berdasarkan ID Pelanggan (Contoh: /riwayat 12345678)
-/rekap [Tanggal] - [Admin] Menarik data (Contoh: /rekap hari ini)
-/cancel - Membatalkan sesi input yang macet / menggantung
-
-*C. Kendala Sistem*
-Jika bot terasa lambat atau salah merespons, ketik /cancel untuk mereset memori bot, lalu ketik /start kembali. 
-Jika Anda ditolak oleh sistem, silakan lapor ke Master Admin.
-    `;
-    
-    return ctx.reply(pesanHelp, { parse_mode: 'Markdown' });
-});
-
-// ================= MENYALAKAN BOT =================
-console.log('🤖 Mesin Telegraf Bot Telkom sedang melakukan booting...');
-bot.launch();
-console.log('✅ Mesin Telegraf Bot Telkom berhasil menyala dengan Aiven PostgreSQL!');
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
